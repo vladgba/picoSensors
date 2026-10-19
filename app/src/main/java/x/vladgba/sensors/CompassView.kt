@@ -16,9 +16,19 @@ import android.location.Location
 import android.location.LocationManager
 import android.view.View
 import kotlin.math.abs
+import kotlin.math.asin
+import kotlin.math.atan2
+import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.tan
 
-/** Rotating-dial compass. Tap toggles magnetic / true north (when a location is known). */
+/**
+ * Compass. Lying flat → rotating dial. Held upright → horizon view: the directions are
+ * projected onto the real horizon in front of the camera, so N/E/S/W sit where they are.
+ * Tap toggles magnetic / true north (when a location is known).
+ */
 @SuppressLint("ViewConstructor")
 class CompassView(ctx: Context) : View(ctx), SensorEventListener, Screen {
 
@@ -42,6 +52,7 @@ class CompassView(ctx: Context) : View(ctx), SensorEventListener, Screen {
     private var magAccuracy = -1
     private var declination: Float? = null
     private var trueNorth = false
+    private var horizonMode = false    // phone upright → horizon view
 
     private val ringPaint = Ui.stroke(Ui.GRID, Ui.dp(ctx, 2f))
     private val tickMajor = Ui.stroke(Ui.FG, Ui.dp(ctx, 2.5f))
@@ -58,6 +69,14 @@ class CompassView(ctx: Context) : View(ctx), SensorEventListener, Screen {
     private val hubPaint = Ui.fill(Ui.BG)
     private val hubRing = Ui.stroke(Ui.ACCENT, Ui.dp(ctx, 2f))
     private val path = Path()
+
+    // horizon view
+    private val horizonLine = Ui.stroke(Ui.AMBER, Ui.dp(ctx, 2.5f))
+    private val horizonTick = Ui.stroke(Ui.FG, Ui.dp(ctx, 2f))
+    private val horizonTickMinor = Ui.stroke(Ui.DIM, Ui.dp(ctx, 1.2f))
+    private val reticle = Ui.stroke(Ui.ACCENT, Ui.dp(ctx, 2f))
+    private val pt = FloatArray(2)
+    private val pt2 = FloatArray(2)
 
     init {
         setBackgroundColor(Ui.BG)
@@ -134,9 +153,13 @@ class CompassView(ctx: Context) : View(ctx), SensorEventListener, Screen {
     }
 
     private fun apply(alpha: Float) {
-        // When the phone is held upright (screen facing the user), use the camera
-        // direction instead of the unstable "top edge" azimuth.
-        val m = if (abs(rot[8]) < 0.45f) {
+        // rot[8] = how much the screen faces the sky. Upright (screen facing the user) →
+        // horizon view using the camera direction instead of the unstable "top edge" azimuth.
+        // Hysteresis keeps the view from flickering around the threshold.
+        val up = abs(rot[8])
+        if (horizonMode && up > 0.55f) horizonMode = false
+        else if (!horizonMode && up < 0.45f) horizonMode = true
+        val m = if (horizonMode) {
             SensorManager.remapCoordinateSystem(rot, SensorManager.AXIS_X, SensorManager.AXIS_Z, rotRemap)
             rotRemap
         } else rot
@@ -157,8 +180,10 @@ class CompassView(ctx: Context) : View(ctx), SensorEventListener, Screen {
         val cx = w / 2f
         val top = Ui.dp(context, 24f)
         val headH = headPaint.textSize + subPaint.textSize * 2.2f + Ui.dp(context, 16f)
-        val cy = top + headH + (h - top - headH) / 2f - Ui.dp(context, 8f)
-        val r = min(w * 0.42f, (h - top - headH) * 0.44f)
+        val footH = subPaint.textSize * 3.2f + Ui.dp(context, 18f)   // two hint lines at the bottom
+        val area = h - top - headH - footH
+        val cy = top + headH + area / 2f
+        val r = min(w * 0.42f, area * 0.46f)
 
         if (rotSensor == null && (accSensor == null || magSensor == null)) {
             canvas.drawText("No compass sensor on this device", cx, h / 2f, subPaint)
@@ -177,6 +202,27 @@ class CompassView(ctx: Context) : View(ctx), SensorEventListener, Screen {
         }
         canvas.drawText(ref, cx, top + headPaint.textSize + subPaint.textSize * 1.5f, subPaint)
 
+        if (horizonMode) drawHorizon(canvas, w, h, top + headH) else drawDial(canvas, cx, cy, r, shown)
+
+        // Calibration hint + view hint
+        val (txt, col) = when (magAccuracy) {
+            SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "Calibration: high" to Ui.GREEN
+            SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "Calibration: medium" to Ui.AMBER
+            SensorManager.SENSOR_STATUS_ACCURACY_LOW, SensorManager.SENSOR_STATUS_UNRELIABLE ->
+                "Calibration low – wave the phone in a figure 8" to Ui.RED
+            else -> "" to Ui.DIM
+        }
+        val bottom = h - Ui.dp(context, 18f)
+        if (txt.isNotEmpty()) {
+            subPaint.color = col
+            canvas.drawText(txt, cx, bottom, subPaint)
+            subPaint.color = Ui.DIM
+        }
+        val hint = if (horizonMode) "Lay the phone flat for the dial" else "Hold the phone upright to see the horizon"
+        canvas.drawText(hint, cx, if (txt.isNotEmpty()) bottom - subPaint.textSize * 1.5f else bottom, subPaint)
+    }
+
+    private fun drawDial(canvas: Canvas, cx: Float, cy: Float, r: Float, shown: Float) {
         // Fixed index mark at the top of the dial
         path.reset()
         val iy = cy - r - Ui.dp(context, 6f)
@@ -229,19 +275,90 @@ class CompassView(ctx: Context) : View(ctx), SensorEventListener, Screen {
 
         canvas.drawCircle(cx, cy, r * 0.05f, hubPaint)
         canvas.drawCircle(cx, cy, r * 0.05f, hubRing)
+    }
 
-        // Calibration hint
-        val (txt, col) = when (magAccuracy) {
-            SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "Calibration: high" to Ui.GREEN
-            SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "Calibration: medium" to Ui.AMBER
-            SensorManager.SENSOR_STATUS_ACCURACY_LOW, SensorManager.SENSOR_STATUS_UNRELIABLE ->
-                "Calibration low – wave the phone in a figure 8" to Ui.RED
-            else -> "" to Ui.DIM
+    /**
+     * Pinhole projection of a world direction (bearing / elevation, degrees) onto the screen,
+     * looking through the back camera. Returns false when the point is behind the camera.
+     * World frame of [rot]: x = east, y = magnetic north, z = up; world = rot · device.
+     */
+    private fun project(bearing: Float, elevation: Float, cx: Float, cy: Float, f: Float, out: FloatArray): Boolean {
+        val decl = if (trueNorth) declination ?: 0f else 0f
+        val b = Math.toRadians((bearing - decl).toDouble())
+        val e = Math.toRadians(elevation.toDouble())
+        val vx = (cos(e) * sin(b)).toFloat()
+        val vy = (cos(e) * cos(b)).toFloat()
+        val vz = sin(e).toFloat()
+        // device = rotᵀ · world
+        val dx = rot[0] * vx + rot[3] * vy + rot[6] * vz
+        val dy = rot[1] * vx + rot[4] * vy + rot[7] * vz
+        val depth = -(rot[2] * vx + rot[5] * vy + rot[8] * vz)   // camera looks along −Z
+        if (depth < 0.05f) return false
+        out[0] = cx + f * dx / depth
+        out[1] = cy - f * dy / depth
+        return true
+    }
+
+    private fun drawHorizon(canvas: Canvas, w: Float, h: Float, top: Float) {
+        val cx = w / 2f
+        val cy = top + (h - top) / 2f
+        val f = (w / 2f) / tan(Math.toRadians(HFOV / 2.0)).toFloat()
+        val shown = if (trueNorth && declination != null) (heading + declination!! + 360f) % 360f else heading
+        val span = 75f
+
+        // horizon line
+        path.reset()
+        var started = false
+        var b = shown - span
+        while (b <= shown + span) {
+            if (project(b, 0f, cx, cy, f, pt)) {
+                if (started) path.lineTo(pt[0], pt[1]) else path.moveTo(pt[0], pt[1])
+                started = true
+            } else started = false
+            b += 2f
         }
-        if (txt.isNotEmpty()) {
-            subPaint.color = col
-            canvas.drawText(txt, cx, h - Ui.dp(context, 18f), subPaint)
-            subPaint.color = Ui.DIM
+        canvas.drawPath(path, horizonLine)
+
+        // ticks every 5°, labels every 15° (cardinals in colour), all perpendicular to the horizon
+        val labels = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+        var d = (ceil((shown - span) / 5f) * 5f).toInt()
+        while (d <= shown + span) {
+            val deg = ((d % 360) + 360) % 360
+            val major = deg % 15 == 0
+            val len = if (major) 3f else 1.5f
+            if (project(d.toFloat(), 0f, cx, cy, f, pt) && project(d.toFloat(), len, cx, cy, f, pt2)) {
+                canvas.drawLine(pt[0], pt[1], pt2[0], pt2[1], if (major) horizonTick else horizonTickMinor)
+                if (major && project(d.toFloat(), len + 2.5f, cx, cy, f, pt2)) {
+                    // rotate the label so it stands up from the horizon
+                    val ang = Math.toDegrees(atan2((pt2[0] - pt[0]).toDouble(), (pt[1] - pt2[1]).toDouble())).toFloat()
+                    canvas.save()
+                    canvas.rotate(ang, pt2[0], pt2[1])
+                    val (text, paint) = when {
+                        deg == 0 -> "N" to northPaint
+                        deg % 90 == 0 -> labels[deg / 45] to cardPaint
+                        deg % 45 == 0 -> labels[deg / 45] to interPaint
+                        else -> deg.toString() to numPaint
+                    }
+                    canvas.drawText(text, pt2[0], pt2[1], paint)
+                    canvas.restore()
+                }
+            }
+            d += 5
         }
+
+        // camera reticle + elevation of the line of sight
+        val rr = Ui.dp(context, 14f)
+        canvas.drawCircle(cx, cy, rr, reticle)
+        canvas.drawLine(cx, cy - rr * 2.2f, cx, cy - rr, reticle)
+        canvas.drawLine(cx, cy + rr, cx, cy + rr * 2.2f, reticle)
+        canvas.drawLine(cx - rr * 2.2f, cy, cx - rr, cy, reticle)
+        canvas.drawLine(cx + rr, cy, cx + rr * 2.2f, cy, reticle)
+        val elev = Math.toDegrees(asin((-rot[8]).coerceIn(-1f, 1f).toDouble())).toFloat()
+        canvas.drawText(Ui.f("Elevation %+.0f°", elev), cx, cy + rr * 2.2f + subPaint.textSize * 1.6f, subPaint)
+    }
+
+    private companion object {
+        /** Horizontal field of view of the horizon view, close to a typical phone camera. */
+        const val HFOV = 60.0
     }
 }

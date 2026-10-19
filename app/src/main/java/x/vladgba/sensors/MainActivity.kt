@@ -37,7 +37,7 @@ class MainActivity : Activity() {
         TABS.forEachIndexed { i, name ->
             val tv = TextView(this).apply {
                 text = name
-                textSize = 15f
+                textSize = 14f
                 gravity = Gravity.CENTER
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 isClickable = true
@@ -72,7 +72,8 @@ class MainActivity : Activity() {
         0 -> CompassView(this)
         1 -> LevelView(this)
         2 -> RulerScreen(this)
-        else -> GpsView(this)
+        3 -> GpsView(this)
+        else -> SensorsScreen(this)
     }
 
     private fun select(i: Int) {
@@ -121,7 +122,7 @@ class MainActivity : Activity() {
     companion object {
         const val PREFS = "pico"
         private const val KEY_TAB = "tab"
-        private val TABS = arrayOf("Compass", "Level", "Ruler", "GPS")
+        private val TABS = arrayOf("Compass", "Level", "Ruler", "GPS", "Sensors")
 
     }
 }

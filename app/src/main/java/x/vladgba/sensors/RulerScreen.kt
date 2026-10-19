@@ -16,9 +16,7 @@ import android.widget.TextView
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.hypot
-import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sqrt
 
 /** Ruler page: drawing surface + toolbar (shape, units, calibration). */
 class RulerScreen(ctx: Context) : LinearLayout(ctx), Screen {
@@ -38,9 +36,12 @@ class RulerScreen(ctx: Context) : LinearLayout(ctx), Screen {
             orientation = HORIZONTAL
             setBackgroundColor(Ui.BG)
         }
-        val modes = arrayOf("Line", "Triangle", "Square")
-        modes.forEachIndexed { i, name ->
-            val b = button(name) { ruler.mode = i; refresh() }
+        MODES.forEachIndexed { i, name ->
+            val b = button(name) {
+                // while calibrating these buttons become  −  /  Reset  /  +
+                if (ruler.calibrating) ruler.nudgeCal(i - 1) else ruler.mode = i
+                refresh()
+            }
             modeButtons.add(b)
             bar.addView(b, LayoutParams(0, LayoutParams.MATCH_PARENT, 1f))
         }
@@ -63,7 +64,13 @@ class RulerScreen(ctx: Context) : LinearLayout(ctx), Screen {
 
     private fun refresh() {
         modeButtons.forEachIndexed { i, b ->
-            b.setTextColor(if (i == ruler.mode && !ruler.calibrating) Ui.ACCENT else Ui.DIM)
+            if (ruler.calibrating) {
+                b.text = CAL_BUTTONS[i]
+                b.setTextColor(Ui.FG)
+            } else {
+                b.text = MODES[i]
+                b.setTextColor(if (i == ruler.mode) Ui.ACCENT else Ui.DIM)
+            }
         }
         unitBtn.text = if (ruler.inches) "in" else "mm"
         unitBtn.setTextColor(Ui.FG)
@@ -74,6 +81,11 @@ class RulerScreen(ctx: Context) : LinearLayout(ctx), Screen {
 
     override fun start() {}
     override fun stop() = ruler.save()
+
+    private companion object {
+        val MODES = arrayOf("Line", "Triangle", "Square")
+        val CAL_BUTTONS = arrayOf("−", "Reset", "+")
+    }
 }
 
 @SuppressLint("ViewConstructor")
@@ -109,10 +121,11 @@ class RulerView(ctx: Context) : View(ctx) {
     // handles (pixels)
     private var ax = 0f; private var ay = 0f      // line A
     private var bx = 0f; private var by = 0f      // line B
-    private var tx = 0f; private var ty = 0f      // triangle legs
+    private val tri = FloatArray(6)               // triangle vertices A, B, C (x, y pairs)
     private var sx = 0f; private var sy = 0f      // square corner
     private var initialised = false
     private var active = -1
+    private var lastTouchY = 0f                   // calibration drag is relative
 
     private val tick = Ui.stroke(Ui.FG, Ui.dp(ctx, 1.2f))
     private val tickLabel = Ui.text(Ui.FG, Ui.sp(ctx, 11f))
@@ -126,7 +139,10 @@ class RulerView(ctx: Context) : View(ctx) {
     private val smallText = Ui.text(Ui.DIM, Ui.sp(ctx, 13f))
     private val infoText = Ui.text(Ui.FG, Ui.sp(ctx, 15f), align = Paint.Align.LEFT)
     private val cardStroke = Ui.stroke(Ui.AMBER, Ui.dp(ctx, 2f))
+    private val cardFill = Ui.fill(0x18FFCA28)
+    private val angleText = Ui.text(Ui.AMBER, Ui.sp(ctx, 13f), bold = true)
     private val rect = RectF()
+    private val path = Path()
 
     private val handleR = Ui.dp(ctx, 13f)
     private val margin = Ui.dp(ctx, 30f)   // keeps handles clear of the edge scales
@@ -136,12 +152,21 @@ class RulerView(ctx: Context) : View(ctx) {
             .putBoolean("ruler_in", inches).apply()
     }
 
+    /** Fine-tune the calibration: -1 / +1 = one 0.1 % step, 0 = back to the reported DPI. */
+    fun nudgeCal(dir: Int) {
+        cal = if (dir == 0) 1f else (cal * (1f + dir * 0.001f)).coerceIn(CAL_MIN, CAL_MAX)
+        save()
+        invalidate()
+    }
+
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         if (!initialised && w > 0 && h > 0) {
             ax = margin + 10 * pxX; ay = h * 0.35f
             bx = w - margin; by = h * 0.35f
-            tx = w * 0.7f; ty = h * 0.5f
+            tri[0] = w * 0.25f; tri[1] = h * 0.22f
+            tri[2] = w * 0.80f; tri[3] = h * 0.30f
+            tri[4] = w * 0.35f; tri[5] = h * 0.62f
             sx = w * 0.6f; sy = w * 0.6f * pxY / pxX
             initialised = true
         }
@@ -153,7 +178,10 @@ class RulerView(ctx: Context) : View(ctx) {
         if (w <= 0f) return
         ax = ax.coerceIn(0f, w); ay = ay.coerceIn(0f, h)
         bx = bx.coerceIn(0f, w); by = by.coerceIn(0f, h)
-        tx = tx.coerceIn(margin, w); ty = ty.coerceIn(margin, h)
+        for (i in 0..2) {
+            tri[2 * i] = tri[2 * i].coerceIn(0f, w)
+            tri[2 * i + 1] = tri[2 * i + 1].coerceIn(0f, h)
+        }
         sx = sx.coerceIn(margin, w); sy = sy.coerceIn(margin, h)
     }
 
@@ -176,10 +204,11 @@ class RulerView(ctx: Context) : View(ctx) {
                 active = when {
                     calibrating -> 9
                     mode == 0 -> if (hypot(x - ax, y - ay) < hypot(x - bx, y - by)) 0 else 1
-                    mode == 1 -> if (hypot(x - tx, y - margin) < hypot(x - margin, y - ty)) 2 else 3
+                    mode == 1 -> 10 + (0..2).minBy { hypot(x - tri[2 * it], y - tri[2 * it + 1]) }
                     else -> 4
                 }
-                move(x, y)
+                lastTouchY = y
+                if (active != 9) move(x, y)
             }
             MotionEvent.ACTION_MOVE -> move(x, y)
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -194,8 +223,7 @@ class RulerView(ctx: Context) : View(ctx) {
         when (active) {
             0 -> { ax = x; ay = y }
             1 -> { bx = x; by = y }
-            2 -> tx = x
-            3 -> ty = y
+            10, 11, 12 -> { val i = active - 10; tri[2 * i] = x; tri[2 * i + 1] = y }
             4 -> {
                 sx = x; sy = y
                 // snap to a perfect square when close
@@ -203,9 +231,10 @@ class RulerView(ctx: Context) : View(ctx) {
                 if (abs(wmm - hmm) < 2f) { val m = (wmm + hmm) / 2f; sx = m * pxX; sy = m * pxY }
             }
             9 -> {
-                // card width in px determines the scale
-                val target = max(x, Ui.dp(context, 60f))
-                cal = (target / (CARD_W * baseX)).coerceIn(0.5f, 2f)
+                // Relative drag: the card's bottom edge follows the finger's vertical motion,
+                // so the finger never has to cover the edge being aligned.
+                cal = (cal + (y - lastTouchY) / (CARD_W * baseY)).coerceIn(CAL_MIN, CAL_MAX)
+                lastTouchY = y
             }
         }
         clampAll()
@@ -331,25 +360,63 @@ class RulerView(ctx: Context) : View(ctx) {
     }
 
     private fun drawTriangle(c: Canvas, h: Float) {
-        val p = Path()
-        p.moveTo(0f, 0f); p.lineTo(tx, 0f); p.lineTo(0f, ty); p.close()
-        c.drawPath(p, shapeFill)
-        c.drawPath(p, shapeStroke)
-        // guides from the handles to the grips
-        c.drawLine(tx, 0f, tx, margin, guide)
-        c.drawLine(0f, ty, margin, ty, guide)
-        handle(c, tx, margin); handle(c, margin, ty)
+        path.reset()
+        path.moveTo(tri[0], tri[1]); path.lineTo(tri[2], tri[3]); path.lineTo(tri[4], tri[5]); path.close()
+        c.drawPath(path, shapeFill)
+        c.drawPath(path, shapeStroke)
 
-        val a = tx / pxX; val b = ty / pxY
-        val hyp = sqrt(a * a + b * b)
-        val alpha = Math.toDegrees(atan2(b, a).toDouble()).toFloat()
-        pill(c, len(a), tx / 2, margin + Ui.dp(context, 26f))
-        pill(c, len(b), margin + Ui.dp(context, 50f), ty / 2)
-        pill(c, len(hyp), tx / 2 + Ui.dp(context, 20f), ty / 2 + Ui.dp(context, 20f))
-        drawInfo(c, listOf(
-            Ui.f("Angles %.1f° / %.1f° / 90°", alpha, 90f - alpha),
-            "Area ${area(a * b / 2f)}"
-        ), h)
+        // geometry in millimetres (x/y scales may differ slightly)
+        val mx = FloatArray(3) { tri[2 * it] / pxX }
+        val my = FloatArray(3) { tri[2 * it + 1] / pxY }
+        val gx = (tri[0] + tri[2] + tri[4]) / 3f
+        val gy = (tri[1] + tri[3] + tri[5]) / 3f
+        var perimeter = 0f
+
+        // side lengths: side i joins vertex i and i+1, label pushed away from the centroid
+        for (i in 0..2) {
+            val j = (i + 1) % 3
+            val l = hypot(mx[j] - mx[i], my[j] - my[i])
+            perimeter += l
+            val midX = (tri[2 * i] + tri[2 * j]) / 2f
+            val midY = (tri[2 * i + 1] + tri[2 * j + 1]) / 2f
+            val (ox, oy) = unit(midX - gx, midY - gy)
+            pill(c, len(l), midX + ox * Ui.dp(context, 30f), midY + oy * Ui.dp(context, 30f))
+        }
+
+        // interior angles just inside each vertex; right angles get the usual square mark
+        for (i in 0..2) {
+            val j = (i + 1) % 3; val k = (i + 2) % 3
+            val ux = mx[j] - mx[i]; val uy = my[j] - my[i]
+            val vx = mx[k] - mx[i]; val vy = my[k] - my[i]
+            val ang = Math.toDegrees(atan2(abs(ux * vy - uy * vx), ux * vx + uy * vy).toDouble()).toFloat()
+            val px = tri[2 * i]; val py = tri[2 * i + 1]
+            if (abs(ang - 90f) < 0.5f) drawRightAngle(c, i, j, k)
+            val (dx, dy) = unit(gx - px, gy - py)
+            val d = Ui.dp(context, 42f)
+            c.drawText(Ui.f("%.1f°", ang), px + dx * d, py + dy * d + angleText.textSize * 0.35f, angleText)
+        }
+
+        for (i in 0..2) handle(c, tri[2 * i], tri[2 * i + 1])
+
+        val area = abs((mx[1] - mx[0]) * (my[2] - my[0]) - (mx[2] - mx[0]) * (my[1] - my[0])) / 2f
+        drawInfo(c, listOf("Perimeter ${len(perimeter)}", "Area ${area(area)}"), h)
+    }
+
+    private fun drawRightAngle(c: Canvas, i: Int, j: Int, k: Int) {
+        val px = tri[2 * i]; val py = tri[2 * i + 1]
+        val s = Ui.dp(context, 14f)
+        val (ax1, ay1) = unit(tri[2 * j] - px, tri[2 * j + 1] - py)
+        val (ax2, ay2) = unit(tri[2 * k] - px, tri[2 * k + 1] - py)
+        path.reset()
+        path.moveTo(px + ax1 * s, py + ay1 * s)
+        path.lineTo(px + (ax1 + ax2) * s, py + (ay1 + ay2) * s)
+        path.lineTo(px + ax2 * s, py + ay2 * s)
+        c.drawPath(path, shapeStroke)
+    }
+
+    private fun unit(x: Float, y: Float): Pair<Float, Float> {
+        val l = hypot(x, y)
+        return if (l < 1e-3f) 0f to 0f else (x / l) to (y / l)
     }
 
     private fun drawSquare(c: Canvas, h: Float) {
@@ -368,27 +435,37 @@ class RulerView(ctx: Context) : View(ctx) {
     }
 
     private fun drawCalibration(c: Canvas, w: Float, h: Float) {
-        val cw = CARD_W * pxX; val ch = CARD_H * pxY
+        // Portrait card: the short side (53.98 mm) fits across every phone, the long side
+        // (85.60 mm) runs down the screen and is the one being matched.
+        val cw = CARD_H * pxX; val ch = CARD_W * pxY
         rect.set(0f, 0f, cw, ch)
-        c.drawRoundRect(rect, 3.2f * pxX, 3.2f * pxX, cardStroke)
-        c.drawLine(cw, 0f, cw, h, guide)
-        val y0 = min(ch + Ui.dp(context, 40f), h * 0.6f)
+        val r = 3.2f * pxX
+        c.drawRoundRect(rect, r, r, cardFill)
+        c.drawRoundRect(rect, r, r, cardStroke)
+        c.drawLine(0f, ch, w, ch, guide)
+
         val lines = listOf(
             "Calibration",
-            "Put a bank card in the top-left corner",
-            "and drag sideways until the outline",
-            "matches its width (85.60 mm).",
+            "Put a bank card upright in the top-left",
+            "corner and drag up/down until its bottom",
+            "edge matches (85.60 mm).",
+            "Fine-tune with − / +",
             Ui.f("Scale %.1f %%", cal * 100f)
         )
-        var y = y0
+        val step = smallText.textSize * 1.6f
+        val blockH = step * lines.size
+        // below the card when it fits, otherwise pinned to the bottom of the view
+        var y = min(ch + Ui.dp(context, 36f), h - blockH)
         for (s in lines) {
             c.drawText(s, w / 2, y, if (s == lines[0]) pillText else smallText)
-            y += smallText.textSize * 1.6f
+            y += step
         }
     }
 
     companion object {
         private const val CARD_W = 85.60f
         private const val CARD_H = 53.98f
+        private const val CAL_MIN = 0.5f
+        private const val CAL_MAX = 2f
     }
 }
